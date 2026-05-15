@@ -14,6 +14,10 @@ def describe_error(
     *,
     include_locals: bool = False,
     max_chain_depth: int = 10,
+    source_context_lines: int = 3,
+    caller_context: bool = True,
+    max_caller_frames: int = 32,
+    max_group_depth: int = 10,
 ) -> ErrorReport:
     ...
 ```
@@ -23,6 +27,10 @@ def describe_error(
 - **`exc`** - the exception to describe. If `None`, falls back to `sys.exc_info()[1]` so you can call `describe_error()` bare inside an `except` block.
 - **`include_locals`** - when `True`, captures `frame.f_locals` for each traceback frame. Each value is passed through a truncating, repr-safe representation. Off by default because frame locals can contain secrets that shouldn't leak into logs.
 - **`max_chain_depth`** - hard cap on `__cause__` / `__context__` chain following. Defaults to 10. Guards against pathological or cyclic chains.
+- **`source_context_lines`** - lines of source code captured either side of the error line per frame. Default 3 (7-line window including the error line). Common leading whitespace is stripped across the window for legibility. Set to 0 to disable. Applies to every frame in the report - traceback, chain, group children, and caller context.
+- **`caller_context`** - when `True` (default), also walks the call stack ABOVE the catch site so the report shows who called the function that's now handling the exception. Skips frames inside `error_handler.py` so only user-code frames appear. Each frame has the same shape as a traceback frame (file, line, function, code, optional source_context, optional locals).
+- **`max_caller_frames`** - cap on caller context walking. Default 32. A `{"truncated": "max_caller_frames_reached"}` marker is appended when the cap is hit so deeply recursive callers don't lose information silently.
+- **`max_group_depth`** - cap on nested `ExceptionGroup` recursion. Default 10. Uses stdlib `BaseExceptionGroup` on Python 3.11+, falls back to duck typing for the 3.10 `exceptiongroup` backport. Cycle-protected automatically.
 
 ### Return type
 

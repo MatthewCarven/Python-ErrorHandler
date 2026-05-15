@@ -10,10 +10,12 @@ catches broken __repr__/__str__, chain walking honors guards, dispatch table
 finds the right extractor via MRO, flags toggle behavior as documented.
 
 For visual examples of actual output, see test_chain.py / test_dispatch.py /
-test_locals.py / test_formatter.py / test_heavy.py - those are runnable
-documentation rather than assertion tests.
+test_locals.py / test_formatter.py / test_heavy.py / test_caller_context.py
+/ test_group.py - those are runnable documentation rather than assertion
+tests.
 """
 
+import sys
 import unittest
 
 from error_handler import describe_error, ErrorReport
@@ -308,5 +310,255 @@ class LocalsFlagTests(unittest.TestCase):
         self.assertEqual(target["locals"]["magic_string"], "'abracadabra'")
 
 
+# ---------------------------------------------------------------------------
+# Source context window (new)
+# ---------------------------------------------------------------------------
+
+class SourceContextTests(unittest.TestCase):
+
+    def test_source_context_captured_by_default(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        for f in d["traceback"]:
+            self.assertIn("source_context", f)
+            self.assertIsInstance(f["source_context"], list)
+
+    def test_source_context_marks_error_line(self):
+        def boom():
+            raise RuntimeError("kaboom")
+        try:
+            boom()
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        target = next(f for f in d["traceback"] if f["function"] == "boom")
+        ctx = target["source_context"]
+        # Exactly one line should be the error line.
+        marked = [c for c in ctx if c["is_error_line"]]
+        self.assertEqual(len(marked), 1)
+        self.assertEqual(marked[0]["lineno"], target["line"])
+
+    def test_source_context_is_dedented(self):
+        # Function body is indented; the captured window should have the
+        # common leading whitespace stripped so it reads cleanly.
+        def deeply():
+            def nested():
+                raise RuntimeError("kaboom")
+            nested()
+        try:
+            deeply()
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        target = next(f for f in d["traceback"] if f["function"] == "nested")
+        ctx = target["source_context"]
+        # At least one non-blank line should start with non-whitespace after
+        # dedent (otherwise dedent didn't run).
+        non_blank = [c["text"] for c in ctx if c["text"].strip()]
+        self.assertTrue(non_blank, "expected captured non-blank lines")
+        self.assertTrue(
+            any(not line.startswith(" ") for line in non_blank),
+            "expected at least one line to be flush left after dedent",
+        )
+
+    def test_source_context_disabled_when_zero(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e, source_context_lines=0).to_dict()
+        for f in d["traceback"]:
+            self.assertNotIn("source_context", f)
+
+
+# ---------------------------------------------------------------------------
+# Caller context (new)
+# ---------------------------------------------------------------------------
+
+class CallerContextTests(unittest.TestCase):
+
+    def test_caller_context_captured_by_default(self):
+        def thrower():
+            raise RuntimeError("kaboom")
+        try:
+            thrower()
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertIn("caller_context", d)
+        # Test method is itself a caller above the catch -> non-empty list.
+        self.assertGreater(len(d["caller_context"]), 0)
+
+    def test_caller_context_skips_error_handler_frames(self):
+        import os
+        import error_handler as eh_module
+        eh_file = os.path.normcase(os.path.abspath(eh_module.__file__))
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        # No captured caller frame should be exactly the error_handler module
+        # file. (Substring matching is wrong here because the test file path
+        # CONTAINS 'error_handler.py' as a substring.)
+        for f in d["caller_context"]:
+            if f.get("truncated"):
+                continue
+            cap_file = os.path.normcase(os.path.abspath(f["file"]))
+            self.assertNotEqual(
+                cap_file, eh_file,
+                "caller_context leaked an internal frame: " + str(f),
+            )
+
+    def test_caller_context_disabled_when_flag_false(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e, caller_context=False).to_dict()
+        self.assertNotIn("caller_context", d)
+
+    def test_caller_context_respects_max_frames(self):
+        # Recurse deeper than the cap so we know more frames exist.
+        def recurse(n):
+            if n <= 0:
+                try:
+                    int("nope")
+                except Exception as e:
+                    return describe_error(e, max_caller_frames=3).to_dict()
+            return recurse(n - 1)
+        d = recurse(10)
+        real = [f for f in d["caller_context"] if not f.get("truncated")]
+        self.assertEqual(len(real), 3)
+        truncs = [
+            f for f in d["caller_context"]
+            if f.get("truncated") == "max_caller_frames_reached"
+        ]
+        self.assertEqual(len(truncs), 1)
+
+    def test_caller_context_honors_include_locals(self):
+        def helper():
+            sentinel_name = "sentinel_value"
+            try:
+                int("nope")
+            except Exception as e:
+                return describe_error(e, include_locals=True).to_dict()
+        d = helper()
+        # Find the helper frame in caller_context (it's the immediate frame
+        # above the catch since the catch IS in helper).
+        # Actually the catch is in helper, so caller_context[0] is the test
+        # method that called helper. The helper frame is inside traceback,
+        # not caller_context. Check that caller_context frames carry locals
+        # when the flag is on.
+        for f in d["caller_context"]:
+            if f.get("truncated"):
+                continue
+            self.assertIn("locals", f)
+
+
+# ---------------------------------------------------------------------------
+# ExceptionGroup support (new) - Python 3.11+
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(
+    sys.version_info >= (3, 11),
+    "ExceptionGroup requires Python 3.11+ (or `exceptiongroup` backport)",
+)
+class GroupTests(unittest.TestCase):
+
+    def _make_group(self):
+        children = []
+        try:
+            raise TypeError("type-child")
+        except TypeError as e:
+            children.append(e)
+        try:
+            raise ValueError("value-child")
+        except ValueError as e:
+            children.append(e)
+        return ExceptionGroup("outer", children)
+
+    def test_group_children_field_present_for_group(self):
+        try:
+            raise self._make_group()
+        except BaseException as e:
+            d = describe_error(e).to_dict()
+        self.assertIn("group_children", d)
+        self.assertEqual(len(d["group_children"]), 2)
+
+    def test_group_children_field_absent_for_non_group(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertNotIn("group_children", d)
+
+    def test_group_children_have_full_introspection(self):
+        try:
+            raise self._make_group()
+        except BaseException as e:
+            d = describe_error(e).to_dict()
+        types = [c["type"] for c in d["group_children"]]
+        self.assertIn("TypeError", types)
+        self.assertIn("ValueError", types)
+        # Each child has its own traceback.
+        for child in d["group_children"]:
+            self.assertIn("traceback", child)
+            self.assertGreater(len(child["traceback"]), 0)
+
+    def test_nested_groups_recurse(self):
+        inner_children = []
+        try:
+            raise KeyError("inner-key")
+        except KeyError as e:
+            inner_children.append(e)
+        inner = ExceptionGroup("inner", inner_children)
+        outer = ExceptionGroup("outer", [inner])
+        try:
+            raise outer
+        except BaseException as e:
+            d = describe_error(e).to_dict()
+        self.assertEqual(len(d["group_children"]), 1)
+        inner_data = d["group_children"][0]
+        self.assertIn("group_children", inner_data)
+        self.assertEqual(inner_data["group_children"][0]["type"], "KeyError")
+
+    def test_type_specific_extractors_fire_on_group_children(self):
+        # KeyError's missing_key extractor should still trigger when the
+        # KeyError is buried inside a group.
+        children = []
+        try:
+            {}["missing"]
+        except KeyError as e:
+            children.append(e)
+        group = ExceptionGroup("g", children)
+        try:
+            raise group
+        except BaseException as e:
+            d = describe_error(e).to_dict()
+        child = d["group_children"][0]
+        self.assertIn("missing_key", child["type_specific"])
+        self.assertIn("missing", child["type_specific"]["missing_key"])
+
+    def test_max_group_depth_caps_nesting(self):
+        # Build a 5-deep group nest, ask for depth 2 -> truncation marker.
+        inner = ExceptionGroup("d5", [RuntimeError("leaf")])
+        for i in range(4, 0, -1):
+            inner = ExceptionGroup("d" + str(i), [inner])
+        try:
+            raise inner
+        except BaseException as e:
+            d = describe_error(e, max_group_depth=2).to_dict()
+        # Drill down until we hit the truncation marker.
+        node = d
+        depth = 0
+        while "group_children" in node and node["group_children"]:
+            child = node["group_children"][0]
+            if child.get("truncated") == "max_group_depth_reached":
+                break
+            node = child
+            depth += 1
+            if depth > 10:
+                self.fail("never hit max_group_depth truncation marker")
+        else:
+            self.fail("never reached a truncation marker")
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

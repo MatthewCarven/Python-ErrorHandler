@@ -35,7 +35,97 @@ Built `error_handler.py` from scratch with one public function `describe_error()
 - **Chain ordering differs between formatters by design.** Concise = chronological (matches Python's traceback printing). Heavy = nearest-to-oldest (matches walker order, easier for an LLM to navigate as data).
 - **Dispatch table is MRO-walked.** Registering for a base type covers all subclasses. The whole table is ~5 seeded entries; projects can add their own via `_register`.
 
-### Notes for the next session
+## 2026-05-15 - Source context, caller context, ExceptionGroup
+
+Three additions to `error_handler.py`, each behind a public parameter:
+
+### New parameters on `describe_error()`
+
+- `source_context_lines: int = 3` - capture N lines either side of the error
+  line per frame, common leading whitespace stripped. Default 3 produces a
+  7-line window. Set to 0 to disable. Applies to traceback frames, chain-link
+  frames, group-child frames, and caller-context frames uniformly.
+- `caller_context: bool = True` - walk the call stack ABOVE the catch site
+  (frames not in `exc.__traceback__`), so the report shows who called the
+  function that's now handling the exception. Skips frames in error_handler.py.
+- `max_caller_frames: int = 32` - cap on the caller_context walk. Truncation
+  marker appended when exceeded so deeply recursive callers don't lose
+  information silently.
+- `max_group_depth: int = 10` - cap on nested ExceptionGroup recursion.
+
+### New data dict keys
+
+- Per-frame: `source_context: [{lineno, text, is_error_line}, ...]` when
+  `source_context_lines > 0`. Existing `code` field unchanged for backward
+  compat.
+- Top-level (primary exception only): `caller_context: [frame, ...]` when
+  `caller_context=True`. Same frame shape as `traceback` entries, plus
+  optional `{'truncated': 'max_caller_frames_reached'}` marker.
+- Per-exception: `group_children: [data_dict, ...]` when the exception is
+  an ExceptionGroup. Each child is a full `_build_data` result (so it has
+  its own type-specific extractor results, chain, traceback, and - if it's
+  itself a group - its own `group_children`). Truncation markers for
+  `cycle_detected` and `max_group_depth_reached`.
+
+### Implementation notes
+
+- `_frame_dict(frame, lineno, ...)` extracted as a shared helper used by
+  both `_walk_traceback` (passes `tb.tb_lineno`) and `_walk_caller_context`
+  (passes `frame.f_lineno`). Same frame dict shape across both axes.
+- `_capture_source_context()` reads `linecache.getlines()`, slices around the
+  error line, computes common leading whitespace across non-blank lines, and
+  dedents. Empty list when linecache returns nothing (dynamic code, REPL).
+- `_walk_caller_context()` walks `sys._getframe(N)` from N=1 upward, skipping
+  frames whose `f_code.co_filename == __file__`. Once past our own frames it
+  captures the rest up to `max_caller_frames`. Whole walk wrapped in a
+  try/except so a broken stack walk lands in `partial_failures` instead of
+  killing the report.
+- `_walk_group()` recurses through `exc.exceptions`. Uses `_BaseExceptionGroup
+  = BaseExceptionGroup` on 3.11+, with duck-typing fallback (`tuple-valued
+  .exceptions` attr + `'ExceptionGroup'` in classname) so the module works on
+  3.10 with the `exceptiongroup` backport. Cycle protection via id-keyed
+  `_group_visited` set shared across the whole recursion.
+
+### Formatter updates
+
+- Concise: source context window replaces the single `code` line under each
+  `File "..."` header (line numbers right-justified, `>>` marker on the error
+  line). Caller context appended after the primary exception with its own
+  header. Group children rendered inline at the end of each exception's
+  block, with `+---------- group child N of M ----------` separators.
+- Heavy: explicit `Source context (lines A-B):` block under each frame's
+  `Code:`. New top-level `CALLER CONTEXT (N frame(s) above the catch site,
+  nearest-to-oldest)` section between PRIMARY EXCEPTION and CAUSE/CONTEXT
+  CHAIN. Group children rendered as labeled `--- Child K of N ---` blocks
+  nested under their parent exception with deeper indent.
+
+### Tests
+
+Extended `test_error_handler.py` from 20 to 35 unittest assertions:
+
+- `SourceContextTests` (4): default-on, error line marker exists and matches
+  frame lineno, dedent is applied, `source_context_lines=0` disables.
+- `CallerContextTests` (5): default-on, internal frames skipped, can be
+  disabled, `max_caller_frames` cap with truncation marker, locals captured
+  when `include_locals=True`.
+- `GroupTests` (6, skipped pre-3.11): `group_children` present for groups
+  and absent otherwise, children get full introspection, nested groups
+  recurse, type-specific extractors fire on group children (KeyError's
+  `missing_key` works inside a group), `max_group_depth` caps nesting with
+  truncation marker.
+
+Two visual smoke scripts added: `test_caller_context.py` (a callable chain
+catcher -> middle -> outer -> __main__) and `test_group.py` (3-sibling
+group with a nested group child).
+
+### Hiccups this session
+
+- Bash mount sync issue is persistent across sessions. Several Edits weren't
+  reflected in the Linux bash view of files until a no-op follow-up Edit was
+  applied. Matthew's Windows terminal sees the canonical state - default to
+  running tests there.
+
+## Notes for the next session
 
 - **Bash mount sync flakiness.** During this session, edits made via the file tools (Windows side) weren't always immediately reflected in the Linux bash mount the sandbox uses. Matthew ended up running tests from his Windows terminal directly to verify - that path always worked. If returning to this project from a fresh session, prefer running tests on Matthew's machine, or restart the sandbox to refresh the mount.
 - **Write tool truncation around 8-10KB.** Writing the full `error_handler.py` (~300 lines / ~10KB) in a single Write got cut off mid-file twice. Workaround: write the initial scaffold then grow the file via `Edit`. Same caution applies to large guide/doc files - chunk them.

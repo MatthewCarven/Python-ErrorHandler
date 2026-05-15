@@ -74,3 +74,73 @@ If the handler itself blows up:
     "handler_failure": repr(internal_exc),
 }
 ```
+
+## v2 additions (2026-05-15)
+
+Three features added on top of the v1 contract. All backward-compatible:
+existing fields preserved, new fields added, no breaking changes to the
+public signature (only new keyword-only params).
+
+10. **Source context window** - `source_context_lines: int = 3` captures
+    N lines either side of each frame's error line, dedents common leading
+    whitespace, stores as `frame["source_context"]: [{lineno, text,
+    is_error_line}, ...]`. Existing `code` (single line) untouched. Applies
+    uniformly to traceback frames, chain-link frames, group-child frames,
+    and caller-context frames. Set to 0 to disable.
+
+11. **Caller context** - `caller_context: bool = True` adds a top-level
+    `caller_context: [frame, ...]` field on the primary exception listing
+    frames ABOVE the catch site (i.e. who called the function that's now
+    handling the exception). Walks `sys._getframe()` upward, skips frames
+    whose filename matches `error_handler.__file__`. Capped at
+    `max_caller_frames: int = 32` with a truncation marker on overflow.
+    Nearest-to-oldest order (the catch's caller is frame 0).
+
+12. **ExceptionGroup support** - For exceptions where `isinstance(exc,
+    BaseExceptionGroup)` (or the 3.10 duck-type fallback succeeds), each
+    member of `exc.exceptions` is recursively walked as a full
+    `_build_data` result and stored under `group_children: [...]`. Nested
+    groups recurse. Cap via `max_group_depth: int = 10`. Cycle-protected
+    by an id-keyed visited set shared across the whole recursion.
+
+### Updated public API
+
+```python
+def describe_error(
+    exc=None,
+    *,
+    include_locals=False,
+    max_chain_depth=10,
+    source_context_lines=3,    # NEW
+    caller_context=True,       # NEW
+    max_caller_frames=32,      # NEW
+    max_group_depth=10,        # NEW
+) -> ErrorReport: ...
+```
+
+### Updated dict shape (additive)
+
+```python
+{
+    ...                          # all v1 keys preserved
+    "traceback": [{
+        ...                      # all v1 frame keys preserved
+        "source_context": [      # NEW: per frame, when source_context_lines > 0
+            {"lineno": int, "text": str, "is_error_line": bool},
+            ...
+        ],
+    }],
+    "caller_context": [          # NEW: top-level, primary only
+        {... same shape as traceback frames ...},
+        {"truncated": "max_caller_frames_reached"},  # only when capped
+    ],
+    "group_children": [          # NEW: present only when exc is a group
+        {... full _build_data dict, may itself contain group_children ...},
+        {"truncated": "cycle_detected" | "max_group_depth_reached"},
+    ],
+}
+```
+
+Tests extended from 20 to 35 assertions. ExceptionGroup tests are
+auto-skipped on Python < 3.11 when the `exceptiongroup` backport isn't
+available.
