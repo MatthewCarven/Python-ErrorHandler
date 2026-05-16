@@ -22,10 +22,14 @@ description possible: repr(exc) and type(exc).__name__.
 
 from __future__ import annotations
 
+import contextvars
 import linecache
+import os
+import platform
+import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +53,9 @@ def _safe_capture(label, fn, default, failures):
 
 
 def _safe_repr(value, max_len=_REPR_MAX_LEN_DEFAULT):
-    """repr(value) that survives broken __repr__ and truncates long output."""
+    """repr(value) that survives broken __repr__, applies active redactors,
+    then truncates long output. Redaction runs BEFORE truncation so a long
+    secret can't get partially exposed by the truncation cut."""
     try:
         s = repr(value)
     except BaseException:
@@ -57,9 +63,153 @@ def _safe_repr(value, max_len=_REPR_MAX_LEN_DEFAULT):
             return "<unrepresentable: " + type(value).__name__ + ">"
         except BaseException:
             return "<unrepresentable>"
+    s = _redact(s)
     if len(s) > max_len:
         return s[:max_len] + "... [truncated, full len=" + str(len(s)) + "]"
     return s
+
+
+# ---------------------------------------------------------------------------
+# Redaction hooks
+# ---------------------------------------------------------------------------
+#
+# A redactor is a callable: str -> str. Registered redactors run on every
+# string the handler captures (locals, args, source lines, source context,
+# exception messages, notes). Designed so that `include_locals=True` can be
+# used in production without leaking secrets that happen to live in frame
+# locals or hardcoded source.
+#
+# Active redactor state lives in a ContextVar so concurrent describe_error
+# calls (threads / asyncio tasks) don't stomp on each other's lists. The
+# module-level _DEFAULT_REDACTORS is the registry used when describe_error
+# is called without an explicit `redactors=` argument.
+#
+# Every redactor call is individually try/except'd so a broken redactor
+# falls back to the un-redacted string rather than breaking the report.
+
+_DEFAULT_REDACTORS: List[Callable[[str], str]] = []
+_active_redactors: contextvars.ContextVar = contextvars.ContextVar(
+    "error_handler_active_redactors", default=()
+)
+
+
+def register_redactor(fn: Callable[[str], str]) -> Callable[[str], str]:
+    """Add a redactor (str -> str) to the global default list. Returns the
+    function for decorator-style use:
+
+        @register_redactor
+        def hide_my_secret(s):
+            return s.replace("hunter2", "<redacted>")
+    """
+    _DEFAULT_REDACTORS.append(fn)
+    return fn
+
+
+def clear_redactors() -> None:
+    """Empty the global default redactor list. Mostly useful in tests."""
+    _DEFAULT_REDACTORS.clear()
+
+
+def redact_pattern(
+    pattern, replacement: str = "<redacted>", flags: int = 0,
+) -> Callable[[str], str]:
+    """Helper: turn a regex into a registered-ready redactor.
+
+        register_redactor(redact_pattern(r"sk-[A-Za-z0-9]{20,}"))
+        register_redactor(redact_pattern(r"password=\\S+", "password=<redacted>"))
+
+    `pattern` is a string or a pre-compiled re.Pattern. Compilation failures
+    return a no-op redactor (so a bad pattern can't break the registry call
+    site). All matches are replaced.
+    """
+    try:
+        compiled = pattern if hasattr(pattern, "sub") else re.compile(pattern, flags)
+    except BaseException:
+        return lambda s: s
+    def redactor(s):
+        try:
+            return compiled.sub(replacement, s)
+        except BaseException:
+            return s
+    return redactor
+
+
+def _redact(s):
+    """Apply the active redactors in order. Each call individually wrapped
+    so a broken redactor falls back to the prior value, never raises."""
+    if not isinstance(s, str):
+        return s
+    redactors = _active_redactors.get()
+    if not redactors:
+        return s
+    for r in redactors:
+        try:
+            s = r(s)
+        except BaseException:
+            pass
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Environment snapshot
+# ---------------------------------------------------------------------------
+
+def _capture_environment(env_vars, failures):
+    """Capture Python/platform/process basics. Safe-wrapped end-to-end - if
+    any single field blows up it gets recorded in partial_failures and the
+    snapshot continues with the rest.
+
+    env_vars (iterable of names) is the only way env vars are captured;
+    passing None or [] means no env vars in the snapshot (default).
+    """
+    env = {}
+    env["python_version"] = _safe_capture(
+        "env.python_version", lambda: sys.version.split("\n")[0],
+        "<unknown>", failures,
+    )
+    env["python_implementation"] = _safe_capture(
+        "env.python_implementation", platform.python_implementation,
+        "<unknown>", failures,
+    )
+    env["platform"] = _safe_capture(
+        "env.platform", platform.platform, "<unknown>", failures,
+    )
+    env["system"] = _safe_capture(
+        "env.system", platform.system, "<unknown>", failures,
+    )
+    env["machine"] = _safe_capture(
+        "env.machine", platform.machine, "<unknown>", failures,
+    )
+    env["cwd"] = _safe_capture(
+        "env.cwd", os.getcwd, "<unknown>", failures,
+    )
+    env["pid"] = _safe_capture(
+        "env.pid", os.getpid, "<unknown>", failures,
+    )
+    env["argv"] = _safe_capture(
+        "env.argv", lambda: list(sys.argv), [], failures,
+    )
+    env["executable"] = _safe_capture(
+        "env.executable", lambda: sys.executable, "<unknown>", failures,
+    )
+    if env_vars:
+        captured = {}
+        for name in env_vars:
+            try:
+                val = os.environ.get(name)
+            except BaseException as inner:
+                try:
+                    failures.append({
+                        "step": "env.var[" + str(name) + "]",
+                        "error": repr(inner),
+                    })
+                except BaseException:
+                    pass
+                continue
+            if val is not None:
+                captured[name] = _redact(val)
+        env["env_vars"] = captured
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +251,13 @@ class ErrorReport:
 # ---------------------------------------------------------------------------
 
 def _extract_notes(exc):
-    """Return __notes__ as a list of strings, surviving non-iterable junk."""
+    """Return __notes__ as a list of strings, surviving non-iterable junk.
+    Each note is run through the active redactors."""
     notes = getattr(exc, "__notes__", None)
     if notes is None:
         return []
     try:
-        return [str(n) for n in notes]
+        return [_redact(str(n)) for n in notes]
     except TypeError:
         return [_safe_repr(notes)]
 
@@ -168,7 +319,8 @@ def _frame_dict(frame, lineno, include_locals, source_context_lines, failures):
     code = frame.f_code
     filename = code.co_filename
     function = code.co_name
-    source = linecache.getline(filename, lineno).strip() or None
+    raw_source = linecache.getline(filename, lineno).strip()
+    source = _redact(raw_source) if raw_source else None
     out = {
         "file": filename,
         "line": lineno,
@@ -277,7 +429,7 @@ def _capture_source_context(filename, lineno, n_lines):
         text = line[common:] if len(line) >= common else line
         out.append({
             "lineno": ln,
-            "text": text,
+            "text": _redact(text),
             "is_error_line": (ln == lineno),
         })
     return out
@@ -592,8 +744,8 @@ def _build_data(
     data = {}
     data["type"] = _safe_capture("type", lambda: type(exc).__name__, "<unknown>", failures)
     data["module"] = _safe_capture("module", lambda: type(exc).__module__, "<unknown>", failures)
-    data["message"] = _safe_capture("message", lambda: str(exc), "<unrenderable>", failures)
-    data["repr"] = _safe_capture("repr", lambda: repr(exc), "<unrepresentable>", failures)
+    data["message"] = _safe_capture("message", lambda: _redact(str(exc)), "<unrenderable>", failures)
+    data["repr"] = _safe_capture("repr", lambda: _redact(repr(exc)), "<unrepresentable>", failures)
     data["args"] = _safe_capture(
         "args",
         lambda: tuple(_safe_repr(a) for a in getattr(exc, "args", ())),
@@ -648,6 +800,9 @@ def describe_error(
     caller_context=True,
     max_caller_frames=32,
     max_group_depth=10,
+    environment_snapshot=True,
+    env_vars=None,
+    redactors=None,
 ):
     """Inspect an exception and return an ErrorReport. NEVER raises.
 
@@ -667,6 +822,15 @@ def describe_error(
         max_group_depth: cap on nested ExceptionGroup recursion (Python
             3.11+ groups, or the 3.10 `exceptiongroup` backport detected
             via duck typing). Cycle protection is automatic.
+        environment_snapshot: capture a small runtime context block
+            (Python version, platform, cwd, pid, argv). Default on.
+        env_vars: optional iterable of environment variable names to
+            include in the snapshot. None / empty => no env vars captured
+            (the default; secrets often live in env vars).
+        redactors: optional iterable of (str -> str) callables, used INSTEAD
+            of the module-level registry for this call. Pass [] to disable
+            redaction entirely. Default None means "use whatever has been
+            registered via register_redactor()".
     """
     try:
         if exc is None:
@@ -677,24 +841,43 @@ def describe_error(
                 "no_active_exception": True,
             })
 
-        failures = []
-        data = _build_data(
-            exc, failures, max_chain_depth,
-            include_locals=include_locals,
-            source_context_lines=source_context_lines,
-            max_group_depth=max_group_depth,
-        )
-        if caller_context:
-            data["caller_context"] = _safe_capture(
-                "caller_context",
-                lambda: _walk_caller_context(
-                    include_locals, source_context_lines, max_caller_frames, failures,
-                ),
-                [],
-                failures,
+        # Activate redactors for the duration of this call. ContextVar so
+        # concurrent describe_error calls (threads / asyncio tasks) don't
+        # stomp on each other. Reset in finally to leave no residue.
+        if redactors is None:
+            active = tuple(_DEFAULT_REDACTORS)
+        else:
+            active = tuple(redactors)
+        token = _active_redactors.set(active)
+
+        try:
+            failures = []
+            data = _build_data(
+                exc, failures, max_chain_depth,
+                include_locals=include_locals,
+                source_context_lines=source_context_lines,
+                max_group_depth=max_group_depth,
             )
-        data["partial_failures"] = failures
-        return ErrorReport(data)
+            if caller_context:
+                data["caller_context"] = _safe_capture(
+                    "caller_context",
+                    lambda: _walk_caller_context(
+                        include_locals, source_context_lines, max_caller_frames, failures,
+                    ),
+                    [],
+                    failures,
+                )
+            if environment_snapshot:
+                data["environment"] = _safe_capture(
+                    "environment",
+                    lambda: _capture_environment(env_vars, failures),
+                    {},
+                    failures,
+                )
+            data["partial_failures"] = failures
+            return ErrorReport(data)
+        finally:
+            _active_redactors.reset(token)
 
     except BaseException as handler_failure:
         try:
@@ -1014,6 +1197,22 @@ def _format_heavy(data):
     else:
         lines.append("CAUSE / CONTEXT CHAIN")
         lines.append("  (no chained exceptions)")
+
+    env = data.get("environment") or {}
+    if env:
+        lines.append("")
+        lines.append("ENVIRONMENT")
+        for key in (
+            "python_version", "python_implementation", "platform",
+            "system", "machine", "executable", "cwd", "pid", "argv",
+        ):
+            if key in env:
+                lines.append("  " + key + ": " + str(env[key]))
+        evars = env.get("env_vars") or {}
+        if evars:
+            lines.append("  env_vars:")
+            for k, v in evars.items():
+                lines.append("    " + str(k) + " = " + str(v))
 
     lines.append("")
     failures = data.get("partial_failures") or []

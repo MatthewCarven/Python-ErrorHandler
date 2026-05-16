@@ -55,10 +55,26 @@ except Exception:
 ## What you get for free
 
 - Exception type, module, message, repr, args, `__notes__`
-- Full traceback with file/line/function/source-line per frame
+- Full traceback with source context window (3 lines either side of the error line, dedented)
+- Caller context — the frames ABOVE the catch site, so you also see who called the handler
+- `ExceptionGroup` walked recursively (Python 3.11+ or the 3.10 `exceptiongroup` backport)
 - Cause and context chain (cycle-safe, depth-capped)
 - Type-specific fields for common builtins (`OSError`, `KeyError`, `SyntaxError`, `AttributeError`, `UnicodeError`)
+- Environment snapshot (Python version, platform, cwd, pid, argv) for portable crash reports
 - Partial-failure tracking if introspection itself hit a snag
+
+## Redacting secrets
+
+If `include_locals=True` might surface tokens, passwords, or API keys, register a redactor:
+
+```python
+from error_handler import register_redactor, redact_pattern
+
+register_redactor(redact_pattern(r"sk-[A-Za-z0-9]{20,}"))
+register_redactor(redact_pattern(r"password=\S+", "password=<redacted>"))
+```
+
+Redactors run on every captured string (locals, source lines, messages, notes). See `GUIDE.md` for the full hook surface.
 
 ## That's it
 

@@ -125,6 +125,68 @@ group with a nested group child).
   applied. Matthew's Windows terminal sees the canonical state - default to
   running tests there.
 
+## 2026-05-15 (evening) - Environment snapshot + redaction hooks
+
+Two follow-up additions on the same day as the v2 work, picked from a
+brainstorm of "what would actually earn its keep".
+
+### Environment snapshot
+
+New params: `environment_snapshot: bool = True`, `env_vars: Iterable[str] |
+None = None`. Captures Python version + implementation, platform / system /
+machine, executable path, cwd, pid, argv into top-level `environment: {...}`.
+Env var capture is opt-in via the `env_vars` param to avoid accidentally
+slurping secrets from `os.environ`. Each captured env-var value passes
+through the active redactors.
+
+Renders in the heavy formatter as an `ENVIRONMENT` block (between the chain
+section and `INTERNAL CAPTURE ISSUES`). Concise formatter intentionally
+ignores it - keeps the terse traceback-style log feel.
+
+### Redaction hooks
+
+ContextVar-backed active redactor list + module-level `_DEFAULT_REDACTORS`
+registry. Public surface: `register_redactor(fn)`, `clear_redactors()`,
+`redact_pattern(regex, replacement="<redacted>", flags=0)`. New per-call
+override: `redactors=` (None = use registry, `[]` = disable for this call).
+
+Redaction is applied at every string capture site:
+- `_safe_repr` (covers locals, args, extra_attrs) - BEFORE truncation so a
+  long secret can't get partially exposed by the truncation cut.
+- Single-line `code` field per frame.
+- Every line of `source_context` text.
+- `str(exc)` message and `repr(exc)`.
+- Each `__notes__` string.
+- Captured env var values.
+
+Every redactor call wrapped in `try/except` - a broken redactor falls back
+to the prior string value. Safety-contract intact.
+
+ContextVar means thread-safe and async-safe; redactors set at the start of
+each `describe_error` call are reset in a `finally` so there's never any
+residue between calls.
+
+### Tests
+
+Extended `test_error_handler.py` from 35 to 45 unittest assertions:
+
+- `EnvironmentTests` (4): default-on, can disable, env_vars not captured by
+  default, env_vars captured when requested.
+- `RedactionTests` (6): redactor applies to locals, message, source_context;
+  per-call `redactors=[]` overrides global; broken redactor doesn't crash;
+  `clear_redactors()` works.
+
+New smoke script `test_env_redact.py` - registers two redactors (sk- API
+keys and `hunter2`), triggers an exception with secrets in source AND
+locals AND message, captures PATH/HOME-equivalents, prints both concise
+and heavy.
+
+### Hiccups this session
+
+Same bash mount sync issue as previous sessions - file tool sees the
+canonical state, sandbox bash lags. Couldn't sandbox-test the new code so
+deferred verification to Matthew's terminal as usual.
+
 ## Notes for the next session
 
 - **Bash mount sync flakiness.** During this session, edits made via the file tools (Windows side) weren't always immediately reflected in the Linux bash mount the sandbox uses. Matthew ended up running tests from his Windows terminal directly to verify - that path always worked. If returning to this project from a fresh session, prefer running tests on Matthew's machine, or restart the sandbox to refresh the mount.

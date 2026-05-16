@@ -18,7 +18,13 @@ tests.
 import sys
 import unittest
 
-from error_handler import describe_error, ErrorReport
+from error_handler import (
+    describe_error,
+    ErrorReport,
+    register_redactor,
+    redact_pattern,
+    clear_redactors,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +564,134 @@ class GroupTests(unittest.TestCase):
                 self.fail("never hit max_group_depth truncation marker")
         else:
             self.fail("never reached a truncation marker")
+
+
+# ---------------------------------------------------------------------------
+# Environment snapshot (new)
+# ---------------------------------------------------------------------------
+
+class EnvironmentTests(unittest.TestCase):
+
+    def test_environment_captured_by_default(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertIn("environment", d)
+        env = d["environment"]
+        for key in ("python_version", "platform", "cwd", "pid", "argv"):
+            self.assertIn(key, env, "missing env key: " + key)
+
+    def test_environment_can_be_disabled(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e, environment_snapshot=False).to_dict()
+        self.assertNotIn("environment", d)
+
+    def test_env_vars_not_captured_by_default(self):
+        try:
+            int("nope")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertNotIn("env_vars", d["environment"])
+
+    def test_env_vars_captured_when_requested(self):
+        import os
+        os.environ["ERROR_HANDLER_TEST_VAR"] = "hello"
+        try:
+            try:
+                int("nope")
+            except Exception as e:
+                d = describe_error(
+                    e, env_vars=["ERROR_HANDLER_TEST_VAR", "PATH"],
+                ).to_dict()
+            self.assertIn("env_vars", d["environment"])
+            self.assertEqual(
+                d["environment"]["env_vars"]["ERROR_HANDLER_TEST_VAR"], "hello",
+            )
+        finally:
+            os.environ.pop("ERROR_HANDLER_TEST_VAR", None)
+
+
+# ---------------------------------------------------------------------------
+# Redaction hooks (new)
+# ---------------------------------------------------------------------------
+
+class RedactionTests(unittest.TestCase):
+
+    def setUp(self):
+        # Each test starts with a clean global registry.
+        clear_redactors()
+
+    def tearDown(self):
+        clear_redactors()
+
+    def test_redactor_applies_to_locals(self):
+        register_redactor(redact_pattern(r"hunter2"))
+        def helper():
+            secret = "hunter2"
+            int("nope")
+        try:
+            helper()
+        except Exception as e:
+            d = describe_error(e, include_locals=True).to_dict()
+        target = next(f for f in d["traceback"] if f["function"] == "helper")
+        self.assertEqual(target["locals"]["secret"], "'<redacted>'")
+
+    def test_redactor_applies_to_message(self):
+        register_redactor(redact_pattern(r"hunter2"))
+        try:
+            raise RuntimeError("login failed with hunter2 token")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertNotIn("hunter2", d["message"])
+        self.assertIn("<redacted>", d["message"])
+
+    def test_redactor_applies_to_source_context(self):
+        # Hardcoded secret in source - redactor should catch it in both
+        # the single `code` line and the source_context window.
+        register_redactor(redact_pattern(r"sk-[a-z0-9]+"))
+        def helper():
+            api_key = "sk-totallysecret123"  # noqa: F841
+            int("nope")
+        try:
+            helper()
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        target = next(f for f in d["traceback"] if f["function"] == "helper")
+        for line in target["source_context"]:
+            self.assertNotIn("sk-totallysecret123", line["text"])
+
+    def test_per_call_redactors_override_global(self):
+        register_redactor(redact_pattern(r"hunter2"))
+        try:
+            raise RuntimeError("message with hunter2 in it")
+        except Exception as e:
+            # Pass [] to disable redaction entirely for this call.
+            d = describe_error(e, redactors=[]).to_dict()
+        self.assertIn("hunter2", d["message"])
+
+    def test_broken_redactor_doesnt_crash(self):
+        def bad(s):
+            raise RuntimeError("redactor is broken")
+        register_redactor(bad)
+        try:
+            raise RuntimeError("some message")
+        except Exception as e:
+            # Must not raise; should produce a usable report.
+            d = describe_error(e).to_dict()
+        self.assertIn("message", d)
+        self.assertEqual(d["message"], "some message")
+
+    def test_clear_redactors_works(self):
+        register_redactor(redact_pattern(r"hunter2"))
+        clear_redactors()
+        try:
+            raise RuntimeError("hunter2 should be visible")
+        except Exception as e:
+            d = describe_error(e).to_dict()
+        self.assertIn("hunter2", d["message"])
 
 
 if __name__ == "__main__":

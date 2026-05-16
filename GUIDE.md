@@ -18,6 +18,9 @@ def describe_error(
     caller_context: bool = True,
     max_caller_frames: int = 32,
     max_group_depth: int = 10,
+    environment_snapshot: bool = True,
+    env_vars: Iterable[str] | None = None,
+    redactors: Iterable[Callable[[str], str]] | None = None,
 ) -> ErrorReport:
     ...
 ```
@@ -31,6 +34,36 @@ def describe_error(
 - **`caller_context`** - when `True` (default), also walks the call stack ABOVE the catch site so the report shows who called the function that's now handling the exception. Skips frames inside `error_handler.py` so only user-code frames appear. Each frame has the same shape as a traceback frame (file, line, function, code, optional source_context, optional locals).
 - **`max_caller_frames`** - cap on caller context walking. Default 32. A `{"truncated": "max_caller_frames_reached"}` marker is appended when the cap is hit so deeply recursive callers don't lose information silently.
 - **`max_group_depth`** - cap on nested `ExceptionGroup` recursion. Default 10. Uses stdlib `BaseExceptionGroup` on Python 3.11+, falls back to duck typing for the 3.10 `exceptiongroup` backport. Cycle-protected automatically.
+- **`environment_snapshot`** - when `True` (default), adds a top-level `environment` dict to the report with Python version, implementation (CPython/PyPy/etc.), platform, system, machine, executable path, cwd, pid, and argv. Heavy formatter renders this as an `ENVIRONMENT` block; concise stays clean.
+- **`env_vars`** - optional iterable of environment variable names to capture into `environment["env_vars"]`. Defaults to `None` (no env vars captured). Captured values pass through the active redactors, so registering a token-pattern redactor will scrub any matches that happen to appear in env var values too.
+- **`redactors`** - optional iterable of `(str -> str)` callables that override the module-level registry for this call. `None` (default) means use whatever's been registered via `register_redactor()`. Pass `[]` to disable redaction entirely for one call.
+
+## Redaction hooks
+
+For redacting secrets out of locals, source lines, messages, etc. before they end up in a log or LLM paste:
+
+```python
+from error_handler import register_redactor, redact_pattern
+
+# Register globally - applies to all subsequent describe_error calls.
+register_redactor(redact_pattern(r"sk-[A-Za-z0-9]{20,}"))
+register_redactor(redact_pattern(r"password=\S+", "password=<redacted>"))
+
+# Custom redactor: any (str -> str) callable works.
+@register_redactor
+def hide_internal_hostname(s):
+    return s.replace("prod-db-01.internal", "<host>")
+```
+
+Redactors run on every captured string: locals (after `repr`), function args, exception messages, exception reprs, `__notes__`, source-line `code` field, every line of `source_context`, and captured env var values. Each redactor call is individually `try/except`'d - a broken redactor falls back to the un-redacted string rather than breaking the report.
+
+State is held in a `ContextVar` so concurrent `describe_error` calls (threads / asyncio tasks) don't stomp on each other's redactor lists.
+
+Helpers:
+
+- `register_redactor(fn)` - add to the global list. Returns `fn` so it can be used as a decorator.
+- `clear_redactors()` - empty the global list (mostly for tests).
+- `redact_pattern(pattern, replacement="<redacted>", flags=0)` - turn a regex (str or compiled) into a ready-to-register callable. Compilation failures return a no-op so a bad pattern can't break the call site.
 
 ### Return type
 

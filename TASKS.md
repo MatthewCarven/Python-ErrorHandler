@@ -144,3 +144,49 @@ def describe_error(
 Tests extended from 20 to 35 assertions. ExceptionGroup tests are
 auto-skipped on Python < 3.11 when the `exceptiongroup` backport isn't
 available.
+
+## v2.1 additions (2026-05-15, same day)
+
+Two more features picked from a brainstorm.
+
+13. **Environment snapshot** - `environment_snapshot: bool = True` adds a
+    top-level `environment: {python_version, python_implementation, platform,
+    system, machine, executable, cwd, pid, argv}` dict to the report. Env
+    var capture is OPT-IN via separate `env_vars: Iterable[str] | None`
+    param so `os.environ` secrets aren't accidentally slurped. Captured
+    env values pass through the active redactors. Renders as an
+    `ENVIRONMENT` block in the heavy formatter; concise stays clean.
+
+14. **Redaction hooks** - global registry + ContextVar-backed active list
+    of `(str -> str)` callables that scrub captured strings. Public surface:
+    `register_redactor(fn)`, `clear_redactors()`, `redact_pattern(regex,
+    replacement)`. Per-call override: `redactors=` param (None = registry,
+    `[]` = disable). Applied at `_safe_repr` (BEFORE truncation so partial
+    secrets can't leak through the cut), source lines, source_context text,
+    message, repr, notes, captured env values. Each redactor call individually
+    try/except'd; broken redactors fall back rather than break.
+
+### Updated public API (final)
+
+```python
+def describe_error(
+    exc=None,
+    *,
+    include_locals=False,
+    max_chain_depth=10,
+    source_context_lines=3,
+    caller_context=True,
+    max_caller_frames=32,
+    max_group_depth=10,
+    environment_snapshot=True,    # NEW
+    env_vars=None,                # NEW
+    redactors=None,               # NEW
+) -> ErrorReport: ...
+
+# Redaction registry helpers (module-level)
+def register_redactor(fn): ...
+def clear_redactors(): ...
+def redact_pattern(pattern, replacement="<redacted>", flags=0): ...
+```
+
+Tests extended from 35 to 45 assertions.
